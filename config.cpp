@@ -25,6 +25,7 @@ namespace NeckSnapVR {
 
 	int iDualGrabReleaseGraceFrames = 45;
 	int iMotionDebugLogIntervalFrames = 20;
+	int iAllowEssentialVictims = 1;
 
 	void loadConfig()
 	{
@@ -126,6 +127,9 @@ namespace NeckSnapVR {
 				}
 				else if (variableName == "MotionDebugLogIntervalFrames") {
 					iMotionDebugLogIntervalFrames = std::stoi(variableValueStr);
+				}
+				else if (variableName == "AllowEssentialVictims") {
+					iAllowEssentialVictims = std::stoi(variableValueStr);
 				}
 			}
 		}

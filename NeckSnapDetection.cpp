@@ -13,6 +13,7 @@
 #include "skse64/GameRTTI.h"
 #include "skse64/GameTypes.h"
 #include "skse64/GameFormComponents.h"
+#include "skse64/GameExtraData.h"
 #include "skse64/NiObjects.h"
 #include "skse64/NiNodes.h"
 #include "skse64/NiTypes.h"
@@ -31,6 +32,9 @@ namespace NeckSnapVR
 		UInt32 g_lastDualHeadGrabNpcFormId = 0;
 		UInt32 g_lastNeckSnappedNpcFormId = 0;
 		UInt32 g_loggedDualHeadGrabNpcFormId = 0;
+		UInt32 g_loggedLeftGrabDebugNpcFormId = 0;
+		UInt32 g_loggedRightGrabDebugNpcFormId = 0;
+		UInt32 g_loggedBothHandsGrabDebugNpcFormId = 0;
 		UInt32 g_dualGrabLossFrames = 0;
 		UInt32 g_oppositeMotionFrames = 0;
 		bool g_hasPrevHandPos = false;
@@ -43,11 +47,24 @@ namespace NeckSnapVR
 
 		void UpdateNeckSnapMotion(PlayerCharacter* player, Actor* npc);
 		void KillActorFromNeckSnap(Actor* victim);
-		void ExecuteNeckSnap(Actor* npc);
+		bool ExecuteNeckSnap(Actor* npc);
 		const char* GetActorLogName(Actor* actor);
+		const char* GetFormLogName(TESForm* form);
+		void LogGrabbedNpcDebug(Actor* npc, PlayerCharacter* player, const char* context);
+		void UpdateGrabbedNpcDebugLogging(PlayerCharacter* player);
 		void EndDualHeadGrabSession(const char* reason = nullptr);
 		void TryLatchFromDualHeadGrab(PlayerCharacter* player);
 		NiAVObject* FindHeadBone(Actor* actor);
+		NiAVObject* FindGrabbedBone(Actor* npc, NiObject* rigidBody);
+		NiObject* GetRigidBodyFromBone(NiAVObject* bone);
+		bool IsGrabbedActor(Actor* npc, TESObjectREFR* grabbedRefr);
+		bool IsNonHeadBodyRigidBody(Actor* npc, NiObject* rigidBody);
+		bool IsGrabbedRigidBodyOnHeadBone(Actor* npc, NiObject* rigidBody);
+		bool IsRigidBodyNearHeadBone(Actor* npc, NiObject* rigidBody);
+		bool IsHandGrabbingNpcHead(Actor* npc, bool isLeftHand);
+		bool HasAnyHandGrabbingNpcHead(Actor* npc);
+		bool IsPlayerBehindActor(Actor* npc, Actor* player, float maxDistance);
+		Actor* ResolveGrabbedActor(TESObjectREFR* refr);
 		NiPoint3 MatrixAxis(const NiMatrix33& rot, int axisIndex);
 
 		float VecDot(const NiPoint3& a, const NiPoint3& b)
@@ -387,6 +404,17 @@ namespace NeckSnapVR
 			return IsHumanoidNpc(actor) && !IsActiveFollower(actor);
 		}
 
+		void ClearRuntimeEssential(Actor* actor)
+		{
+			if (!actor) {
+				return;
+			}
+
+			// Only clear the per-actor runtime flag. Do not touch actor values here;
+			// SetBase/SetCurrent on kIsEssential (354) crashes on some NPCs.
+			actor->flags2 &= ~Actor::kFlag_kEssential;
+		}
+
 		void KillActorFromNeckSnap(Actor* victim)
 		{
 			if (!victim || victim->IsDead(1)) {
@@ -398,10 +426,47 @@ namespace NeckSnapVR
 			victim->actorValueOwner.RestoreActorValue(Actor::kDamage, kHealthActorValue, -killDamage);
 		}
 
-		void ExecuteNeckSnap(Actor* npc)
+		bool ExecuteNeckSnap(Actor* npc)
 		{
-			if (!npc || npc->IsDead(1) || IsUndeadActor(npc) || IsEssentialActor(npc) || IsActiveFollower(npc)) {
-				return;
+			if (!npc || npc->IsDead(1)) {
+				return false;
+			}
+
+			if (IsUndeadActor(npc)) {
+				_MESSAGE(
+					"Neck Snap VR [snap]: blocked on '%s' (formId %08X) - undead.",
+					GetActorLogName(npc),
+					npc->formID);
+				return false;
+			}
+
+			if (IsActiveFollower(npc)) {
+				_MESSAGE(
+					"Neck Snap VR [snap]: blocked on '%s' (formId %08X) - follower.",
+					GetActorLogName(npc),
+					npc->formID);
+				return false;
+			}
+
+			const bool essential = IsEssentialActor(npc);
+			if (essential && !iAllowEssentialVictims) {
+				_MESSAGE(
+					"Neck Snap VR [snap]: blocked on '%s' (formId %08X) - essential (set AllowEssentialVictims=1 to allow).",
+					GetActorLogName(npc),
+					npc->formID);
+				LOG_INFO(
+					"[snap] blocked essential victim '%s' (formId %08X).",
+					GetActorLogName(npc),
+					npc->formID);
+				return false;
+			}
+
+			if (essential) {
+				ClearRuntimeEssential(npc);
+				_MESSAGE(
+					"Neck Snap VR [snap]: cleared essential flag on '%s' (formId %08X) before kill.",
+					GetActorLogName(npc),
+					npc->formID);
 			}
 
 			const bool soundPlayed = PlayNeckSnapSound(npc);
@@ -417,6 +482,7 @@ namespace NeckSnapVR
 			}
 
 			KillActorFromNeckSnap(npc);
+			return true;
 		}
 
 		float GetNeckSnapRange(Actor* npc)
@@ -443,6 +509,360 @@ namespace NeckSnapVR
 			}
 
 			return "Unknown NPC";
+		}
+
+		const char* GetFormLogName(TESForm* form)
+		{
+			if (!form) {
+				return "none";
+			}
+
+			// Head parts and some equipped entries are not safe to query via GetFullName.
+			switch (form->formType) {
+			case kFormType_Armor:
+			case kFormType_Race:
+			case kFormType_NPC:
+			case kFormType_Weapon:
+			case kFormType_Faction:
+			case kFormType_Spell:
+			case kFormType_Book:
+				break;
+			default:
+				return "unnamed";
+			}
+
+			const char* fullName = form->GetFullName();
+			if (fullName && fullName[0] != '\0') {
+				return fullName;
+			}
+
+			const char* name = form->GetName();
+			if (name && name[0] != '\0') {
+				return name;
+			}
+
+			return "unnamed";
+		}
+
+		void SafeFormLabel(TESForm* form, char* outBuffer, size_t bufferSize)
+		{
+			if (!outBuffer || bufferSize == 0) {
+				return;
+			}
+
+			outBuffer[0] = '\0';
+			if (!form) {
+				_snprintf_s(outBuffer, bufferSize, _TRUNCATE, "none");
+				return;
+			}
+
+			switch (form->formType) {
+			case kFormType_Armor:
+			case kFormType_Race:
+			case kFormType_NPC:
+			case kFormType_Weapon:
+			case kFormType_Faction:
+			case kFormType_Spell:
+			case kFormType_Book:
+			{
+				const char* fullName = form->GetFullName();
+				if (fullName && fullName[0] != '\0') {
+					_snprintf_s(outBuffer, bufferSize, _TRUNCATE, "%s", fullName);
+					return;
+				}
+
+				const char* name = form->GetName();
+				if (name && name[0] != '\0') {
+					_snprintf_s(outBuffer, bufferSize, _TRUNCATE, "%s", name);
+					return;
+				}
+				break;
+			}
+			default:
+				break;
+			}
+
+			_snprintf_s(outBuffer, bufferSize, _TRUNCATE, "form:%08X type:%u", form->formID, form->formType);
+		}
+
+		class MatchBySlot : public FormMatcher
+		{
+			UInt32 m_mask;
+
+		public:
+			explicit MatchBySlot(UInt32 mask) : m_mask(mask) {}
+
+			bool Matches(TESForm* form) const override
+			{
+				if (!form) {
+					return false;
+				}
+
+				BGSBipedObjectForm* biped = DYNAMIC_CAST(form, TESForm, BGSBipedObjectForm);
+				return biped && (biped->data.parts & m_mask) != 0;
+			}
+		};
+
+		TESForm* GetActorWornForm(Actor* actor, UInt32 slotMask)
+		{
+			if (!actor) {
+				return nullptr;
+			}
+
+			ExtraContainerChanges* containerChanges =
+				static_cast<ExtraContainerChanges*>(actor->extraData.GetByType(kExtraData_ContainerChanges));
+			if (!containerChanges) {
+				return nullptr;
+			}
+
+			MatchBySlot matcher(slotMask);
+			return containerChanges->FindEquipped(matcher).pForm;
+		}
+
+		const char* GetHumanoidNpcRejectReason(Actor* actor)
+		{
+			if (!actor) {
+				return "null actor";
+			}
+
+			if (actor->IsPlayerRef()) {
+				return "is player";
+			}
+
+			TESNPC* npc = DYNAMIC_CAST(actor->baseForm, TESForm, TESNPC);
+			if (!npc) {
+				return "base form is not NPC";
+			}
+
+			TESRace* race = actor->race;
+			if (!race) {
+				return "missing race";
+			}
+
+			const UInt32 raceFlags = race->data.raceFlags;
+			if ((raceFlags & TESRace::kRace_FaceGenHead) == 0) {
+				return "race missing FaceGenHead";
+			}
+
+			if (raceFlags & TESRace::kRace_Child) {
+				return "race is child";
+			}
+
+			if (raceFlags & TESRace::kRace_Flies) {
+				return "race flies";
+			}
+
+			if (raceFlags & TESRace::kRace_Immobile) {
+				return "race immobile";
+			}
+
+			return nullptr;
+		}
+
+		const char* GetGrabBoneName(Actor* npc, NiObject* rigidBody)
+		{
+			if (!npc || !rigidBody) {
+				return "none";
+			}
+
+			NiAVObject* grabbedBone = FindGrabbedBone(npc, rigidBody);
+			if (!grabbedBone || !grabbedBone->m_name || grabbedBone->m_name[0] == '\0') {
+				return "unknown";
+			}
+
+			return grabbedBone->m_name;
+		}
+
+		void AppendHandGrabDebugLine(
+			Actor* npc,
+			bool isLeftHand,
+			char* outBuffer,
+			size_t bufferSize)
+		{
+			if (!outBuffer || bufferSize == 0) {
+				return;
+			}
+
+			outBuffer[0] = '\0';
+			if (!higgsInterface) {
+				_snprintf_s(outBuffer, bufferSize, _TRUNCATE, "%s=no_higgs", isLeftHand ? "L" : "R");
+				return;
+			}
+
+			if (!higgsInterface->IsHoldingObject(isLeftHand)) {
+				_snprintf_s(outBuffer, bufferSize, _TRUNCATE, "%s=idle", isLeftHand ? "L" : "R");
+				return;
+			}
+
+			TESObjectREFR* grabbedRefr = higgsInterface->GetGrabbedObject(isLeftHand);
+			NiObject* grabbedRigidBody = higgsInterface->GetGrabbedRigidBody(isLeftHand);
+			const bool sameActor = IsGrabbedActor(npc, grabbedRefr);
+			const char* grabBoneName = GetGrabBoneName(npc, grabbedRigidBody);
+			const bool nonHeadBody = grabbedRigidBody && IsNonHeadBodyRigidBody(npc, grabbedRigidBody);
+			const bool onHeadBone = grabbedRigidBody && IsGrabbedRigidBodyOnHeadBone(npc, grabbedRigidBody);
+			const bool nearHead = grabbedRigidBody && IsRigidBodyNearHeadBone(npc, grabbedRigidBody);
+			const bool countsAsHeadGrab = IsHandGrabbingNpcHead(npc, isLeftHand);
+
+			NiAVObject* head = FindHeadBone(npc);
+			NiObject* headRigidBody = GetRigidBodyFromBone(head);
+			float headDistance = -1.0f;
+			if (head && grabbedRigidBody) {
+				NiAVObject* grabbedBone = FindGrabbedBone(npc, grabbedRigidBody);
+				if (grabbedBone) {
+					headDistance = Distance3D(head->m_worldTransform.pos, grabbedBone->m_worldTransform.pos);
+				}
+			}
+
+			_snprintf_s(
+				outBuffer,
+				bufferSize,
+				_TRUNCATE,
+				"%s=grab sameActor=%s bone='%s' nonHeadBody=%s onHeadBone=%s nearHead=%s headDist=%.1f headRbMatch=%s countsAsHead=%s",
+				isLeftHand ? "L" : "R",
+				sameActor ? "Y" : "N",
+				grabBoneName,
+				nonHeadBody ? "Y" : "N",
+				onHeadBone ? "Y" : "N",
+				nearHead ? "Y" : "N",
+				headDistance,
+				(headRigidBody && grabbedRigidBody == headRigidBody) ? "Y" : "N",
+				countsAsHeadGrab ? "Y" : "N");
+		}
+
+		void LogGrabbedNpcDebug(Actor* npc, PlayerCharacter* player, const char* context)
+		{
+			if (!npc || !player) {
+				return;
+			}
+
+			TESRace* race = npc->race;
+			const char* humanoidReject = GetHumanoidNpcRejectReason(npc);
+			const bool validVictim = IsValidNeckSnapVictim(npc);
+			const float snapRange = GetNeckSnapRange(npc);
+			const bool behind = IsPlayerBehindActor(npc, player, snapRange);
+			NiAVObject* headBone = FindHeadBone(npc);
+
+			TESForm* headArmor = GetActorWornForm(npc, BGSBipedObjectForm::kPart_Head);
+			TESForm* hair = GetActorWornForm(npc, BGSBipedObjectForm::kPart_Hair);
+			TESForm* circlet = GetActorWornForm(npc, BGSBipedObjectForm::kPart_Circlet);
+			TESForm* bodyArmor = GetActorWornForm(npc, BGSBipedObjectForm::kPart_Body);
+
+			char leftGrabLine[512]{};
+			char rightGrabLine[512]{};
+			AppendHandGrabDebugLine(npc, true, leftGrabLine, sizeof(leftGrabLine));
+			AppendHandGrabDebugLine(npc, false, rightGrabLine, sizeof(rightGrabLine));
+
+			char raceLabel[128]{};
+			char headArmorLabel[128]{};
+			char hairLabel[128]{};
+			char circletLabel[128]{};
+			char bodyArmorLabel[128]{};
+			SafeFormLabel(race, raceLabel, sizeof(raceLabel));
+			SafeFormLabel(headArmor, headArmorLabel, sizeof(headArmorLabel));
+			SafeFormLabel(hair, hairLabel, sizeof(hairLabel));
+			SafeFormLabel(circlet, circletLabel, sizeof(circletLabel));
+			SafeFormLabel(bodyArmor, bodyArmorLabel, sizeof(bodyArmorLabel));
+
+			const char* headBoneName = "missing";
+			if (headBone && headBone->m_name && headBone->m_name[0] != '\0') {
+				headBoneName = headBone->m_name;
+			}
+
+			const char* actorName = GetActorLogName(npc);
+			const char* rejectLabel = humanoidReject ? humanoidReject : "ok";
+
+			_MESSAGE(
+				"Neck Snap VR [grab-debug] %s: '%s' ref=%08X base=%08X race='%s' raceId=%08X raceFlags=%08X handReach=%.1f "
+				"humanoidReject=%s validVictim=%s essential=%s undead=%s follower=%s dead=%s furniture=%s behind=%s snapRange=%.1f "
+				"headBone='%s' headArmor='%s'(%08X) hair='%s'(%08X) circlet='%s'(%08X) bodyArmor='%s'(%08X) | %s | %s",
+				context ? context : "grab",
+				actorName,
+				npc->formID,
+				npc->baseForm ? npc->baseForm->formID : 0,
+				raceLabel,
+				race ? race->formID : 0,
+				race ? race->data.raceFlags : 0,
+				race ? race->data.handReach : 0.0f,
+				rejectLabel,
+				validVictim ? "Y" : "N",
+				IsEssentialActor(npc) ? "Y" : "N",
+				IsUndeadActor(npc) ? "Y" : "N",
+				IsActiveFollower(npc) ? "Y" : "N",
+				npc->IsDead(1) ? "Y" : "N",
+				IsActorUsingFurniture(npc) ? "Y" : "N",
+				behind ? "Y" : "N",
+				snapRange,
+				headBoneName,
+				headArmorLabel,
+				headArmor ? headArmor->formID : 0,
+				hairLabel,
+				hair ? hair->formID : 0,
+				circletLabel,
+				circlet ? circlet->formID : 0,
+				bodyArmorLabel,
+				bodyArmor ? bodyArmor->formID : 0,
+				leftGrabLine,
+				rightGrabLine);
+			LOG_INFO(
+				"[grab-debug] %s: '%s' ref=%08X race='%s' raceFlags=%08X headArmor='%s' bodyArmor='%s' validVictim=%s behind=%s %s | %s",
+				context ? context : "grab",
+				actorName,
+				npc->formID,
+				raceLabel,
+				race ? race->data.raceFlags : 0,
+				headArmorLabel,
+				bodyArmorLabel,
+				validVictim ? "Y" : "N",
+				behind ? "Y" : "N",
+				leftGrabLine,
+				rightGrabLine);
+		}
+
+		Actor* ResolveGrabbedActorFromHand(bool isLeftHand)
+		{
+			if (!higgsInterface || !higgsInterface->IsHoldingObject(isLeftHand)) {
+				return nullptr;
+			}
+
+			TESObjectREFR* grabbedRefr = higgsInterface->GetGrabbedObject(isLeftHand);
+			return ResolveGrabbedActor(grabbedRefr);
+		}
+
+		void UpdateGrabbedNpcDebugLogging(PlayerCharacter* player)
+		{
+			if (!higgsInterface || !player) {
+				g_loggedLeftGrabDebugNpcFormId = 0;
+				g_loggedRightGrabDebugNpcFormId = 0;
+				return;
+			}
+
+			const bool leftHolding = higgsInterface->IsHoldingObject(true);
+			const bool rightHolding = higgsInterface->IsHoldingObject(false);
+			Actor* leftActor = leftHolding ? ResolveGrabbedActorFromHand(true) : nullptr;
+			Actor* rightActor = rightHolding ? ResolveGrabbedActorFromHand(false) : nullptr;
+			const UInt32 leftFormId = leftActor ? leftActor->formID : 0;
+			const UInt32 rightFormId = rightActor ? rightActor->formID : 0;
+
+			if (!leftHolding) {
+				g_loggedLeftGrabDebugNpcFormId = 0;
+			} else if (leftActor && leftFormId != g_loggedLeftGrabDebugNpcFormId) {
+				g_loggedLeftGrabDebugNpcFormId = leftFormId;
+				LogGrabbedNpcDebug(leftActor, player, "left-hand grab started");
+			}
+
+			if (!rightHolding) {
+				g_loggedRightGrabDebugNpcFormId = 0;
+			} else if (rightActor && rightFormId != g_loggedRightGrabDebugNpcFormId) {
+				g_loggedRightGrabDebugNpcFormId = rightFormId;
+				LogGrabbedNpcDebug(rightActor, player, "right-hand grab started");
+			}
+
+			if (!leftHolding || !rightHolding || !leftActor || !rightActor || leftFormId != rightFormId) {
+				g_loggedBothHandsGrabDebugNpcFormId = 0;
+			} else if (leftFormId != g_loggedBothHandsGrabDebugNpcFormId && HasAnyHandGrabbingNpcHead(leftActor)) {
+				g_loggedBothHandsGrabDebugNpcFormId = leftFormId;
+				LogGrabbedNpcDebug(leftActor, player, "both hands on same NPC");
+			}
 		}
 
 		NiAVObject* FindBone(Actor* actor, const char* boneName)
@@ -1495,6 +1915,14 @@ namespace NeckSnapVR
 			const float leftSpeed = VecLength(leftDelta);
 			const float rightSpeed = VecLength(rightDelta);
 
+			if (!ExecuteNeckSnap(npc)) {
+				_MESSAGE(
+					"Neck Snap VR [motion]: snap motion triggered on '%s' (formId %08X) but execution was blocked.",
+					GetActorLogName(npc),
+					npc->formID);
+				return;
+			}
+
 			_MESSAGE(
 				"Neck Snap VR: %s's neck was snapped (formId %08X).",
 				GetActorLogName(npc),
@@ -1507,8 +1935,6 @@ namespace NeckSnapVR
 				rightSpeed,
 				headTwist,
 				g_peakHeadTwistDegrees);
-
-			ExecuteNeckSnap(npc);
 		}
 
 	}  // namespace
@@ -1519,6 +1945,9 @@ namespace NeckSnapVR
 		g_lastDualHeadGrabNpcFormId = 0;
 		g_lastNeckSnappedNpcFormId = 0;
 		g_loggedDualHeadGrabNpcFormId = 0;
+		g_loggedLeftGrabDebugNpcFormId = 0;
+		g_loggedRightGrabDebugNpcFormId = 0;
+		g_loggedBothHandsGrabDebugNpcFormId = 0;
 		g_dualGrabLossFrames = 0;
 		g_oppositeMotionFrames = 0;
 		g_hasPrevHandPos = false;
@@ -1536,6 +1965,7 @@ namespace NeckSnapVR
 		}
 
 		UpdateBehindReadyState(player);
+		UpdateGrabbedNpcDebugLogging(player);
 		TryLatchFromDualHeadGrab(player);
 		UpdateDualHeadGrabState(player);
 	}

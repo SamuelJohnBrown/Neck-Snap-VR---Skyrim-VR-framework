@@ -49,6 +49,7 @@ namespace NeckSnapVR {
 	// Grab session / debug
 	extern int iDualGrabReleaseGraceFrames;
 	extern int iMotionDebugLogIntervalFrames;
+	extern int iAllowEssentialVictims;
 
 	void loadConfig();
 	
